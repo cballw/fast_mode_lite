@@ -1,16 +1,17 @@
-# app.py — Fast Mode Lite (Grouped + Public-Friendly + Exact Locator Cues)
-# VA Mortgage Checker with CARES Act + VA Circular policy context
-# Minimal UX: Executive summary → Issues (grouped) → Action Pack (copy + download letter)
-# Evidence now includes: File name + Page number + Search phrase + Quote
+# app.py — Fast Mode Lite (Grouped + Public-Friendly + OCR Fallback)
+# Adds OCR for scanned/image-only PDFs via Google Vision + PyMuPDF rendering
 
 import io
 import re
+import base64
 import datetime as dt
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Dict, Tuple
 
 import streamlit as st
+import requests
 from pypdf import PdfReader
+import fitz  # PyMuPDF
 
 # ============================
 # Policy timeline (context only)
@@ -55,10 +56,6 @@ def normalize_excerpt(text: str, limit: int = 140) -> str:
     t = " ".join((text or "").split())
     return t[:limit] + ("…" if len(t) > limit else "")
 
-def extract_pages(pdf_bytes: bytes) -> List[str]:
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    return [(p.extract_text() or "").strip() for p in reader.pages]
-
 def impact_label(sev: int) -> str:
     return "High" if sev >= 4 else "Medium" if sev == 3 else "Low"
 
@@ -67,6 +64,27 @@ def sure_label(c: float) -> str:
 
 def badge(sev: int, conf: float) -> str:
     return f"Impact: {impact_label(sev)} • How sure: {sure_label(conf)}"
+
+def dedupe_evidence(evidence: List[Dict]) -> List[Dict]:
+    seen = set()
+    out = []
+    for ev in evidence:
+        key = (ev.get("doc_name"), ev.get("page_number"), (ev.get("excerpt") or "")[:80])
+        if key not in seen:
+            seen.add(key)
+            out.append(ev)
+    return out
+
+def locator_phrase(excerpt: str, max_words: int = 6) -> str:
+    text = " ".join((excerpt or "").split())
+    text = re.sub(r"[“”\"'`]", "", text)
+    words = text.split()
+
+    stop = {"the","and","or","to","of","a","in","for","with","your","you","is","are","on","this","that","as","be","by","it"}
+    filtered = [w for w in words if w.lower() not in stop]
+
+    pick = filtered if len(filtered) >= max_words else words
+    return " ".join(pick[:max_words]) if pick else ""
 
 def policy_context_text(start: dt.date, end: dt.date) -> str:
     if end >= CARES_EFFECTIVE:
@@ -80,39 +98,8 @@ def policy_context_text(start: dt.date, end: dt.date) -> str:
         "COVID-related servicing actions during early 2020 may require additional clarification."
     )
 
-def dedupe_evidence(evidence: List[Dict]) -> List[Dict]:
-    seen = set()
-    out = []
-    for ev in evidence:
-        key = (ev.get("doc_name"), ev.get("page_number"), (ev.get("excerpt") or "")[:80])
-        if key not in seen:
-            seen.add(key)
-            out.append(ev)
-    return out
-
-def locator_phrase(excerpt: str, max_words: int = 6) -> str:
-    """
-    Builds a short phrase users can search for inside their PDF viewer.
-    Works well on iPad: open PDF → Search → paste phrase.
-    """
-    text = " ".join((excerpt or "").split())
-    text = re.sub(r"[“”\"'`]", "", text)
-    words = text.split()
-
-    stop = {"the","and","or","to","of","a","in","for","with","your","you","is","are","on","this","that","as","be","by","it"}
-    filtered = [w for w in words if w.lower() not in stop]
-
-    pick = filtered if len(filtered) >= max_words else words
-    return " ".join(pick[:max_words]) if pick else ""
-
-def build_letter(
-    borrower_name: str,
-    loan_number: str,
-    property_addr: str,
-    start: dt.date,
-    end: dt.date,
-    questions: List[str]
-) -> str:
+def build_letter(borrower_name: str, loan_number: str, property_addr: str,
+                 start: dt.date, end: dt.date, questions: List[str]) -> str:
     end_txt = end.isoformat() if end else "[end date if applicable]"
     bullets = "\n".join([f"- {q}" for q in questions])
 
@@ -138,13 +125,66 @@ Sincerely,
 """
 
 # ============================
+# OCR (Google Vision)
+# ============================
+def google_vision_ocr_image_bytes(img_bytes: bytes, api_key: str) -> str:
+    url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
+    content_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    payload = {
+        "requests": [{
+            "image": {"content": content_b64},
+            "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+        }]
+    }
+    r = requests.post(url, json=payload, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    try:
+        return data["responses"][0]["fullTextAnnotation"]["text"] or ""
+    except Exception:
+        return ""
+
+def render_pdf_page_to_png(pdf_bytes: bytes, page_index0: int, zoom: float = 2.0) -> bytes:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc.load_page(page_index0)
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    return pix.tobytes("png")
+
+def extract_pages_text_with_ocr(pdf_bytes: bytes, doc_name: str, use_ocr: bool, ocr_page_cap: int) -> List[str]:
+    """
+    1) Try normal PDF text extraction first.
+    2) If a page is empty/very short AND OCR enabled, OCR that page (up to cap).
+    """
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    pages_text = []
+    ocr_used = 0
+    api_key = st.secrets.get("GOOGLE_VISION_API_KEY", "")
+
+    for idx, p in enumerate(reader.pages):
+        t = (p.extract_text() or "").strip()
+        if use_ocr and len(t) < 20 and api_key and ocr_used < ocr_page_cap:
+            try:
+                png = render_pdf_page_to_png(pdf_bytes, idx, zoom=2.0)
+                t2 = google_vision_ocr_image_bytes(png, api_key).strip()
+                if t2:
+                    t = t2
+                ocr_used += 1
+            except Exception:
+                # keep whatever we had
+                pass
+        pages_text.append(t)
+
+    return pages_text
+
+# ============================
 # Fast Mode Lite rules (heuristics)
 # ============================
 def rule_C01(doc_name: str, pages: List[str], start: dt.date, end: dt.date) -> Optional[Finding]:
     covid_hits = []
     delin_hits = []
     for i, t in enumerate(pages, start=1):
-        low = t.lower()
+        low = (t or "").lower()
         if any(k in low for k in ["covid", "forbear", "cares"]):
             covid_hits.append((i, t))
         if any(k in low for k in ["late fee", "delinquen", "past due"]):
@@ -168,7 +208,7 @@ def rule_C01(doc_name: str, pages: List[str], start: dt.date, end: dt.date) -> O
     return Finding(
         rule_id="C-01",
         severity=4,
-        confidence=0.65,
+        confidence=0.70 if any("forbear" in (t or "").lower() for _, t in covid_hits) else 0.65,
         title="COVID relief may not have protected the loan like it should",
         what_we_saw="We found COVID/forbearance language and also delinquency/late-fee language in your documents.",
         why_it_matters="If forbearance was active, delinquency/fees during that period can cause compounding harm and downstream actions.",
@@ -179,11 +219,11 @@ def rule_C01(doc_name: str, pages: List[str], start: dt.date, end: dt.date) -> O
 
 def rule_suspense(doc_name: str, pages: List[str]) -> Optional[Finding]:
     for i, t in enumerate(pages, start=1):
-        if "suspense" in t.lower():
+        if "suspense" in (t or "").lower():
             return Finding(
                 rule_id="C-03",
                 severity=3,
-                confidence=0.60,
+                confidence=0.65,
                 title="Payments may have been routed to suspense",
                 what_we_saw="We found references to payments being held in suspense.",
                 why_it_matters="Suspense can create phantom delinquency and fee cascades if not reconciled.",
@@ -198,13 +238,15 @@ def rule_suspense(doc_name: str, pages: List[str]) -> Optional[Finding]:
 # ============================
 # Analysis + Grouping
 # ============================
-def analyze(docs: List[Tuple[str, bytes]], start: dt.date, end: dt.date) -> List[Dict]:
+def analyze(docs: List[Tuple[str, bytes]], start: dt.date, end: dt.date, use_ocr: bool, ocr_page_cap: int) -> List[Dict]:
     findings = []
     for name, data in docs:
-        pages = extract_pages(data)
+        pages = extract_pages_text_with_ocr(data, name, use_ocr=use_ocr, ocr_page_cap=ocr_page_cap)
+
         f1 = rule_C01(name, pages, start, end)
         if f1:
             findings.append(asdict(f1))
+
         f2 = rule_suspense(name, pages)
         if f2:
             findings.append(asdict(f2))
@@ -215,7 +257,7 @@ def analyze(docs: List[Tuple[str, bytes]], start: dt.date, end: dt.date) -> List
 def group_findings(findings: List[Dict]) -> List[Dict]:
     grouped: Dict[str, Dict] = {}
     for f in findings:
-        key = f["rule_id"]  # group by rule id
+        key = f["rule_id"]
         if key not in grouped:
             grouped[key] = {
                 "rule_id": f["rule_id"],
@@ -252,9 +294,8 @@ def group_findings(findings: List[Dict]) -> List[Dict]:
 # ============================
 st.set_page_config(page_title="Fast Mode Lite — VA Mortgage Checker", layout="wide")
 st.title("Fast Mode Lite — VA Mortgage Checker")
-st.caption("Turns confusing paperwork into a small number of issues and clear next steps.  Not legal advice.")
+st.caption("Now with OCR fallback for scanned PDFs.  Not legal advice.")
 
-# Forbearance window (pre-filled)
 st.subheader("Your COVID forbearance window (used for comparisons)")
 start = st.date_input("Forbearance start", value=dt.date(2020, 1, 1))
 end = st.date_input("Forbearance end", value=dt.date(2025, 7, 31))
@@ -263,9 +304,17 @@ with st.expander("Policy context (CARES Act + VA circulars)"):
     for d, t, u in POLICY_TIMELINE:
         st.markdown(f"- **{d}** — {t}  \n  {u}")
 
+# OCR controls
+st.subheader("OCR settings (for scanned PDFs)")
+use_ocr = st.toggle("Use OCR when a page has no readable text", value=True)
+
+# Cap OCR pages per document to control cost
+ocr_page_cap = st.slider("Max OCR pages per document", min_value=5, max_value=50, value=25, step=5)
+if use_ocr and not st.secrets.get("GOOGLE_VISION_API_KEY", ""):
+    st.warning("OCR is ON but no GOOGLE_VISION_API_KEY is set in Streamlit Secrets.  Add it in Manage app → Settings → Secrets.")
+
 uploads = st.file_uploader("Upload VA mortgage documents (PDF)", type=["pdf"], accept_multiple_files=True)
 
-# Optional fields (kept minimal)
 with st.expander("Optional: Fill for letter download"):
     borrower_name = st.text_input("Borrower name", value="")
     loan_number = st.text_input("Loan number", value="")
@@ -278,15 +327,14 @@ if st.button("Analyze"):
 
     docs = [(u.name, u.getvalue()) for u in uploads]
 
-    with st.spinner("Analyzing…"):
-        raw = analyze(docs, start, end)
+    with st.spinner("Analyzing… (OCR may take a little longer)"):
+        raw = analyze(docs, start, end, use_ocr=use_ocr, ocr_page_cap=ocr_page_cap)
         grouped = group_findings(raw)
 
-    # Executive summary (public-friendly)
     st.subheader("Executive summary")
     if not grouped:
         st.success("No major issues detected by Fast Mode Lite in the text we could read.")
-        st.write("This does not prove everything is fine.  If your PDFs are scanned images, OCR may be needed.")
+        st.write("If you expected issues, increase OCR pages or upload the payment ledger/servicer history PDFs.")
     else:
         top = grouped[0]
         st.warning(f"Likely issue: {top['title']}")
@@ -294,7 +342,6 @@ if st.button("Analyze"):
         st.write("- Your documents contain patterns worth clarifying with your servicer.")
         st.write("- The tool gives you exact locator cues and a ready-to-send letter.")
 
-    # Issues grouped
     st.subheader("Issues found (grouped)")
     if not grouped:
         st.info("No issues found.")
@@ -308,7 +355,6 @@ if st.button("Analyze"):
                 st.write(f"**Policy context:** {g['policy_context']}")
             st.write(f"**Why it matters:** {g['why_it_matters']}")
 
-            # Exact locator cues
             st.write("**Where to look (exact locator cues)**")
             for ev in g["evidence"][:4]:
                 doc = ev.get("doc_name", "")
@@ -333,7 +379,6 @@ if st.button("Analyze"):
                 help="Copy this list into a message to your servicer or notes.",
             )
 
-            # Download letter
             letter = build_letter(borrower_name, loan_number, property_addr, start, end, g["questions"])
             st.download_button(
                 "Download clarification letter (TXT)",
@@ -345,8 +390,7 @@ if st.button("Analyze"):
 
             st.divider()
 
-    # Plain help for the public
     st.subheader("How this helps (plain terms)")
     st.write("1) It groups your paperwork into a small number of issues.")
-    st.write("2) It tells you exactly where to look in your documents (file, page, and a search phrase).")
-    st.write("3) It gives you a ready-to-send clarification letter and questions.")
+    st.write("2) It tells you exactly where to look (file, page, and a search phrase).")
+    st.write("3) It gives you a ready-to-send letter and questions.")
